@@ -85,7 +85,7 @@ app.get('/api/bridge/inject.js', (req, res) => {
  const getPrice=()=>{const body=(document.body?.innerText||'');const cMatch=body.match(/\bC\s*[: ]\s*(\d+(?:\.\d+)?)/i);if(cMatch){const cp=num(cMatch[1]);if(cp&&cp>0&&cp<10000)return cp;}const c=['[data-last-price]','[class*=last-price]','[class*=mark-price]','[class*=current-price]','[class*=quote-price]','[class*=close]'].map(txt).map(num).filter(Boolean);for(const p of c){if(p>0&&p<10000)return p;}const bad=/(p&l|pnl|profit|equity|balance|buying power|account|unrealized|realized|daily|total|cash)/i;const nodes=[...document.querySelectorAll('span,div')].slice(0,2600);for(const n of nodes){const t=n.textContent?.trim();const parent=(n.parentElement?.textContent||'').trim();if(!t||t.length>24||bad.test(t)||bad.test(parent))continue;const p=num(t);if(p&&p>0&&p<10000&&/\\d+\\.\\d+/.test(t))return p;}return null};
  const candles=[];
  let bar=null;
- const roll=(price)=>{const minute=Math.floor(Date.now()/60000)*60000; if(!bar||bar.t!==minute){ if(bar) candles.push(bar); bar={t:minute,o:price,h:price,l:price,c:price}; if(candles.length>180)candles.shift(); } else { bar.h=Math.max(bar.h,price); bar.l=Math.min(bar.l,price); bar.c=price; }};
+ const roll=(price)=>{const slot=Math.floor(Date.now()/5000)*5000; if(!bar||bar.t!==slot){ if(bar) candles.push(bar); bar={t:slot,o:price,h:price,l:price,c:price}; if(candles.length>240)candles.shift(); } else { bar.h=Math.max(bar.h,price); bar.l=Math.min(bar.l,price); bar.c=price; }};
  const pullCommands=async()=>{try{const r=await fetch(host+'/api/bridge/commands');const j=await r.json();return j.commands||[]}catch{return []}};
  const clickByText=(re)=>{const els=[...document.querySelectorAll('button,[role=button],a,div,span')];const el=els.find(e=>re.test((e.textContent||'').trim())&&e.offsetParent!==null);if(el){el.click();return true;}return false;};
  const execCmd=async(c)=>{let ok=false, note='no matching control found';
@@ -119,7 +119,21 @@ app.post('/api/bridge/push', (req, res) => {
   if (symbol && symbol !== 'UNKNOWN') state.market.symbol = String(symbol).toUpperCase();
   if (timeframe) state.market.timeframe = timeframe;
   if (typeof price === 'number' && Number.isFinite(price)) state.market.price = +price.toFixed(2);
-  if (Array.isArray(candles)) state.market.candles = candles.slice(-120);
+  if (Array.isArray(candles)) {
+    const cleaned = [];
+    for (const b of candles.slice(-240)) {
+      const o = Number(b.o ?? b.c ?? b.close);
+      const h = Number(b.h ?? b.c ?? b.close);
+      const l = Number(b.l ?? b.c ?? b.close);
+      const c = Number(b.c ?? b.close);
+      if (![o,h,l,c].every(Number.isFinite)) continue;
+      if (c <= 0 || c > 10000) continue;
+      const prev = cleaned[cleaned.length - 1];
+      if (prev && Math.abs((c - prev.c) / prev.c) > 0.2) continue; // drop obvious outlier jumps
+      cleaned.push({ t: Number(b.t) || Date.now(), o, h, l, c });
+    }
+    state.market.candles = cleaned.slice(-120);
+  }
   if (state.market.candles.length > 1) {
     const base = state.market.candles[0].c ?? state.market.candles[0].close ?? state.market.price;
     state.market.changePct = +(((state.market.price - base) / base) * 100).toFixed(2);
