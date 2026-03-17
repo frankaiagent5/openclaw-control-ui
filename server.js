@@ -24,6 +24,7 @@ const state = {
   market: { symbol: 'AMD', timeframe: '1m', price: 181.24, changePct: 0, candles: [] },
   position: { side: 'FLAT', size: 0, entry: null, stop: null, unrealized: 0 },
   rules: { maxTradesPerDay: 3, riskPerTradePctEquity: 5, breakevenAfterPartials: true, flattenAt: '12:00' },
+  guidance: { text: '', updatedAt: null, strict: true },
   activity: [{ t: Date.now(), msg: 'System online. Frank autonomous mode is default. Waiting for replay bridge + Frank decisions.' }],
   chat: []
 };
@@ -171,6 +172,7 @@ app.get('/api/frank/context', (req, res) => {
     position: state.position,
     account: state.account,
     rules: state.rules,
+    guidance: state.guidance,
     pendingCommands: pendingCommands.length
   });
 });
@@ -234,13 +236,15 @@ app.post('/api/chat', (req, res) => {
   if (!message) return res.status(400).json({ ok: false, error: 'message required' });
   state.chat.push({ role: 'user', message, t: Date.now() });
 
-  const reply = `Got you. Live ${state.market.symbol}: $${state.market.price} (${state.market.changePct}%). ` +
-    `Frank mode=${state.bot.mode}, bridge=${state.bridge.connected ? 'ON' : 'OFF'}, position=${state.position.side}. ` +
-    `I decide entries/exits — your chat guides bias/risk.`;
+  state.guidance = { text: String(message), updatedAt: Date.now(), strict: true };
+  pushActivity(`Guidance updated by Boss: ${String(message).slice(0, 120)}`);
+
+  const reply = `Understood. I will follow your guidance as top priority: "${String(message).slice(0, 120)}". ` +
+    `Live ${state.market.symbol}: $${state.market.price}.`;
   state.chat.push({ role: 'assistant', message: reply, t: Date.now() });
   pushActivity('Frank replied instantly (direct chat mode).');
 
-  res.json({ ok: true, reply });
+  res.json({ ok: true, reply, guidance: state.guidance });
 });
 
 const server = http.createServer(app);
