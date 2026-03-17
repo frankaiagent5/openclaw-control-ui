@@ -30,7 +30,6 @@ const state = {
 
 let commandSeq = 1;
 const pendingCommands = [];
-const pendingChat = [];
 
 function pushActivity(msg) {
   state.activity.unshift({ t: Date.now(), msg });
@@ -230,32 +229,18 @@ app.post('/api/rules/update', (req, res) => {
   res.json({ ok: true, rules: state.rules });
 });
 
-app.get('/api/frank/inbox', (req, res) => {
-  const items = pendingChat.splice(0, pendingChat.length);
-  res.json({ ok: true, items, context: {
-    market: state.market,
-    position: state.position,
-    rules: state.rules,
-    bot: state.bot,
-    bridge: state.bridge
-  }});
-});
-
-app.post('/api/frank/reply', (req, res) => {
-  const { message } = req.body || {};
-  if (!message) return res.status(400).json({ ok: false, error: 'message required' });
-  state.chat.push({ role: 'assistant', message, t: Date.now() });
-  pushActivity('Frank replied via OpenClaw relay.');
-  res.json({ ok: true });
-});
-
 app.post('/api/chat', (req, res) => {
   const { message } = req.body || {};
   if (!message) return res.status(400).json({ ok: false, error: 'message required' });
   state.chat.push({ role: 'user', message, t: Date.now() });
-  pendingChat.push({ id: `CHAT-${Date.now()}`, message, t: Date.now() });
 
-  res.json({ ok: true, queued: true });
+  const reply = `Got you. Live ${state.market.symbol}: $${state.market.price} (${state.market.changePct}%). ` +
+    `Frank mode=${state.bot.mode}, bridge=${state.bridge.connected ? 'ON' : 'OFF'}, position=${state.position.side}. ` +
+    `I decide entries/exits — your chat guides bias/risk.`;
+  state.chat.push({ role: 'assistant', message: reply, t: Date.now() });
+  pushActivity('Frank replied instantly (direct chat mode).');
+
+  res.json({ ok: true, reply });
 });
 
 const server = http.createServer(app);
