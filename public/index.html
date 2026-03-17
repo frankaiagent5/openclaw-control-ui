@@ -3,5 +3,5 @@ async function startBot(){await fetch('/api/bot/start',{method:'POST'})}
 async function stopBot(){await fetch('/api/bot/stop',{method:'POST'})}
 async function sendChat(){const m=chatInput.value.trim();if(!m)return;chatInput.value='';await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:m})})}
 function mic(){const SR=window.SpeechRecognition||window.webkitSpeechRecognition;if(!SR)return alert('SpeechRecognition not supported');const r=new SR();r.onresult=e=>chatInput.value=e.results[0][0].transcript;r.start();}
-async function connectBridge(){const js=await (await fetch('/api/bridge/inject.js')).text();await navigator.clipboard.writeText(js);alert('Bridge script copied. In replay.tradingterminal.com tab: open DevTools console, paste, Enter.');}
+async function connectBridge(){const js=await (await fetch('/api/bridge/inject.js')).text();try{if(navigator.clipboard&&navigator.clipboard.writeText){await navigator.clipboard.writeText(js);alert('Bridge script copied. In replay.tradingterminal.com tab: open DevTools console, paste, Enter.');return;}}catch(e){}window.prompt('Copy this bridge script, then paste it in replay.tradingterminal.com DevTools Console and press Enter:',js);}
 boot();</script></body></html>
