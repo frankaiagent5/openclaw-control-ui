@@ -17,13 +17,14 @@ app.use(express.static(path.join(__dirname, 'public')));
 const state = {
   timezone: 'America/New_York',
   tradingWindow: { start: '09:00', end: '12:00' },
-  bot: { running: false, mode: 'replay', attached: false },
+  bot: { running: true, mode: 'frank', attached: false, autonomous: true },
   bridge: { connected: false, source: 'sim', lastSeen: null },
+  frank: { connected: false, lastDecisionAt: null, lastDecision: 'HOLD', lastReason: 'waiting for context' },
   account: { equity: 100000, sessionPnl: 0, dailyPnl: 0 },
   market: { symbol: 'AMD', timeframe: '1m', price: 181.24, changePct: 0, candles: [] },
   position: { side: 'FLAT', size: 0, entry: null, stop: null, unrealized: 0 },
   rules: { maxTradesPerDay: 3, riskPerTradePctEquity: 5, breakevenAfterPartials: true, flattenAt: '12:00' },
-  activity: [{ t: Date.now(), msg: 'System online. Waiting for replay bridge.' }],
+  activity: [{ t: Date.now(), msg: 'System online. Frank autonomous mode is default. Waiting for replay bridge + Frank decisions.' }],
   chat: []
 };
 
@@ -134,14 +135,51 @@ app.post('/api/bridge/ack', (req, res) => {
   res.json({ ok: true });
 });
 
+app.get('/api/frank/context', (req, res) => {
+  res.json({
+    ok: true,
+    ts: Date.now(),
+    bot: state.bot,
+    bridge: state.bridge,
+    market: state.market,
+    position: state.position,
+    account: state.account,
+    rules: state.rules,
+    pendingCommands: pendingCommands.length
+  });
+});
+
+app.post('/api/frank/decide', (req, res) => {
+  const { action = 'HOLD', reason = '' } = req.body || {};
+  const normalized = String(action).toUpperCase();
+  state.frank.connected = true;
+  state.frank.lastDecisionAt = Date.now();
+  state.frank.lastDecision = normalized;
+  state.frank.lastReason = reason || 'no reason supplied';
+
+  let queued = null;
+  if (['BUY', 'SELL', 'FLATTEN'].includes(normalized)) {
+    const id = `${normalized}-${commandSeq++}`;
+    queued = { id, type: normalized, command: normalized, t: Date.now() };
+    pendingCommands.push(queued);
+    pushActivity(`Frank decision: ${normalized}${reason ? ` — ${reason}` : ''}`);
+  } else {
+    pushActivity(`Frank decision: HOLD${reason ? ` — ${reason}` : ''}`);
+  }
+
+  res.json({ ok: true, queued, frank: state.frank });
+});
+
 app.post('/api/bot/start', (req, res) => {
   state.bot.running = true;
-  pushActivity('Bot started (replay-first mode).');
+  state.bot.autonomous = true;
+  pushActivity('Frank autonomous mode started.');
   res.json({ ok: true, bot: state.bot });
 });
 app.post('/api/bot/stop', (req, res) => {
   state.bot.running = false;
-  pushActivity('Bot paused.');
+  state.bot.autonomous = false;
+  pushActivity('Frank autonomous mode paused.');
   res.json({ ok: true, bot: state.bot });
 });
 app.post('/api/command', (req, res) => {
@@ -175,7 +213,7 @@ app.post('/api/chat', (req, res) => {
   if (m.includes('sell') || m.includes('short')) pendingCommands.push({ id: `SELL-${commandSeq++}`, type: 'SELL', command: 'SELL macro', t: Date.now() });
   if (m.includes('flatten') || m.includes('close')) pendingCommands.push({ id: `FLATTEN-${commandSeq++}`, type: 'FLATTEN', command: 'FLATTEN', t: Date.now() });
 
-  const reply = `Live ${state.market.symbol} ${state.market.timeframe}: $${state.market.price} (${state.market.changePct}%). Bridge=${state.bridge.connected ? 'ON' : 'OFF'}, Bot=${state.bot.running ? 'RUNNING' : 'PAUSED'}, Position=${state.position.side} ${state.position.size}.`;
+  const reply = `Live ${state.market.symbol} ${state.market.timeframe}: $${state.market.price} (${state.market.changePct}%). Bridge=${state.bridge.connected ? 'ON' : 'OFF'}, Frank=${state.frank.connected ? 'CONNECTED' : 'WAITING'}, Bot=${state.bot.running ? 'RUNNING' : 'PAUSED'}, Position=${state.position.side} ${state.position.size}.`;
   state.chat.push({ role: 'assistant', message: reply, t: Date.now() });
   res.json({ ok: true, reply, state });
 });
