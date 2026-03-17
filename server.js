@@ -46,7 +46,15 @@ function simTick() {
   const drift = (Math.random() - 0.48) * 0.3;
   state.market.price = Math.max(1, +(state.market.price + drift).toFixed(2));
   state.market.changePct = +(((state.market.price - 181.24) / 181.24) * 100).toFixed(2);
-  state.market.candles.push({ t: Date.now(), close: state.market.price });
+  const minute = Math.floor(Date.now() / 60000) * 60000;
+  const last = state.market.candles[state.market.candles.length - 1];
+  if (!last || last.t !== minute) {
+    state.market.candles.push({ t: minute, o: state.market.price, h: state.market.price, l: state.market.price, c: state.market.price });
+  } else {
+    last.h = Math.max(last.h, state.market.price);
+    last.l = Math.min(last.l, state.market.price);
+    last.c = state.market.price;
+  }
   state.market.candles = state.market.candles.slice(-120);
 }
 
@@ -74,8 +82,10 @@ app.get('/api/bridge/inject.js', (req, res) => {
  const symbolFromStorage=()=>{for(const k of Object.keys(localStorage)){if(/symbol|ticker|instrument/i.test(k)){const v=localStorage.getItem(k);if(v&&/^[A-Z.]{1,8}$/.test(v))return v;}}return null};
  const symbolFromDom=()=> txt('[data-symbol]')||txt('[class*=symbol]')||txt('[class*=ticker]')||null;
  const getSymbol=()=> (symbolFromUrl()||symbolFromStorage()||symbolFromDom()||'UNKNOWN').toUpperCase();
- const getPrice=()=>{const c=['[data-last-price]','[class*=last-price]','[class*=mark-price]','[class*=current-price]','[class*=quote-price]','[class*=close]'].map(txt).map(num).filter(Boolean);for(const p of c){if(p>0&&p<10000)return p;}const bad=/(p&l|pnl|profit|equity|balance|buying power|account|unrealized|realized|daily)/i;const nodes=[...document.querySelectorAll('span,div')].slice(0,2200);for(const n of nodes){const t=n.textContent?.trim();if(!t||t.length>24||bad.test(t))continue;const p=num(t);if(p&&p>0&&p<10000&&/\\d+\\.\\d+/.test(t))return p;}return null};
+ const getPrice=()=>{const body=(document.body?.innerText||'');const cMatch=body.match(/\bC\s*[: ]\s*(\d+(?:\.\d+)?)/i);if(cMatch){const cp=num(cMatch[1]);if(cp&&cp>0&&cp<10000)return cp;}const c=['[data-last-price]','[class*=last-price]','[class*=mark-price]','[class*=current-price]','[class*=quote-price]','[class*=close]'].map(txt).map(num).filter(Boolean);for(const p of c){if(p>0&&p<10000)return p;}const bad=/(p&l|pnl|profit|equity|balance|buying power|account|unrealized|realized|daily|total|cash)/i;const nodes=[...document.querySelectorAll('span,div')].slice(0,2600);for(const n of nodes){const t=n.textContent?.trim();const parent=(n.parentElement?.textContent||'').trim();if(!t||t.length>24||bad.test(t)||bad.test(parent))continue;const p=num(t);if(p&&p>0&&p<10000&&/\\d+\\.\\d+/.test(t))return p;}return null};
  const candles=[];
+ let bar=null;
+ const roll=(price)=>{const minute=Math.floor(Date.now()/60000)*60000; if(!bar||bar.t!==minute){ if(bar) candles.push(bar); bar={t:minute,o:price,h:price,l:price,c:price}; if(candles.length>180)candles.shift(); } else { bar.h=Math.max(bar.h,price); bar.l=Math.min(bar.l,price); bar.c=price; }};
  const pullCommands=async()=>{try{const r=await fetch(host+'/api/bridge/commands');const j=await r.json();return j.commands||[]}catch{return []}};
  const clickByText=(re)=>{const els=[...document.querySelectorAll('button,[role=button],a,div,span')];const el=els.find(e=>re.test((e.textContent||'').trim())&&e.offsetParent!==null);if(el){el.click();return true;}return false;};
  const execCmd=async(c)=>{let ok=false, note='no matching control found';
@@ -87,8 +97,9 @@ app.get('/api/bridge/inject.js', (req, res) => {
  const push=async()=>{
    const symbol=getSymbol();
    const price=getPrice();
-   if(price){candles.push({t:Date.now(),close:price}); if(candles.length>180)candles.shift();}
-   const payload={symbol,timeframe:'1m',price,candles:candles.slice(-120),raw:{title:document.title,href:location.href}};
+   if(price){roll(price);}
+   const fullBars=bar?[...candles.slice(-119),bar]:candles.slice(-120);
+   const payload={symbol,timeframe:'1m',price,candles:fullBars,raw:{title:document.title,href:location.href}};
    try{await fetch(host+'/api/bridge/push',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});}catch(e){}
    const cmds=await pullCommands();
    for(const c of cmds) await execCmd(c);
@@ -110,7 +121,8 @@ app.post('/api/bridge/push', (req, res) => {
   if (typeof price === 'number' && Number.isFinite(price)) state.market.price = +price.toFixed(2);
   if (Array.isArray(candles)) state.market.candles = candles.slice(-120);
   if (state.market.candles.length > 1) {
-    state.market.changePct = +(((state.market.price - state.market.candles[0].close) / state.market.candles[0].close) * 100).toFixed(2);
+    const base = state.market.candles[0].c ?? state.market.candles[0].close ?? state.market.price;
+    state.market.changePct = +(((state.market.price - base) / base) * 100).toFixed(2);
   }
   if (raw?.title && Math.random() < 0.02) pushActivity(`Bridge sync: ${raw.title}`);
   res.json({ ok: true });
@@ -228,11 +240,6 @@ app.post('/api/chat', (req, res) => {
   if (!message) return res.status(400).json({ ok: false, error: 'message required' });
   state.chat.push({ role: 'user', message, t: Date.now() });
   pendingChat.push({ id: `CHAT-${Date.now()}`, message, t: Date.now() });
-
-  const m = String(message).toLowerCase();
-  if (m.includes('buy')) pendingCommands.push({ id: `BUY-${commandSeq++}`, type: 'BUY', command: 'BUY macro', t: Date.now() });
-  if (m.includes('sell') || m.includes('short')) pendingCommands.push({ id: `SELL-${commandSeq++}`, type: 'SELL', command: 'SELL macro', t: Date.now() });
-  if (m.includes('flatten') || m.includes('close')) pendingCommands.push({ id: `FLATTEN-${commandSeq++}`, type: 'FLATTEN', command: 'FLATTEN', t: Date.now() });
 
   res.json({ ok: true, queued: true });
 });
