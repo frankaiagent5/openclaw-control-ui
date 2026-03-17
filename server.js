@@ -30,6 +30,7 @@ const state = {
 
 let commandSeq = 1;
 const pendingCommands = [];
+const pendingChat = [];
 
 function pushActivity(msg) {
   state.activity.unshift({ t: Date.now(), msg });
@@ -203,19 +204,37 @@ app.post('/api/rules/update', (req, res) => {
   res.json({ ok: true, rules: state.rules });
 });
 
+app.get('/api/frank/inbox', (req, res) => {
+  const items = pendingChat.splice(0, pendingChat.length);
+  res.json({ ok: true, items, context: {
+    market: state.market,
+    position: state.position,
+    rules: state.rules,
+    bot: state.bot,
+    bridge: state.bridge
+  }});
+});
+
+app.post('/api/frank/reply', (req, res) => {
+  const { message } = req.body || {};
+  if (!message) return res.status(400).json({ ok: false, error: 'message required' });
+  state.chat.push({ role: 'assistant', message, t: Date.now() });
+  pushActivity('Frank replied via OpenClaw relay.');
+  res.json({ ok: true });
+});
+
 app.post('/api/chat', (req, res) => {
   const { message } = req.body || {};
   if (!message) return res.status(400).json({ ok: false, error: 'message required' });
   state.chat.push({ role: 'user', message, t: Date.now() });
+  pendingChat.push({ id: `CHAT-${Date.now()}`, message, t: Date.now() });
 
   const m = String(message).toLowerCase();
   if (m.includes('buy')) pendingCommands.push({ id: `BUY-${commandSeq++}`, type: 'BUY', command: 'BUY macro', t: Date.now() });
   if (m.includes('sell') || m.includes('short')) pendingCommands.push({ id: `SELL-${commandSeq++}`, type: 'SELL', command: 'SELL macro', t: Date.now() });
   if (m.includes('flatten') || m.includes('close')) pendingCommands.push({ id: `FLATTEN-${commandSeq++}`, type: 'FLATTEN', command: 'FLATTEN', t: Date.now() });
 
-  const reply = `Live ${state.market.symbol} ${state.market.timeframe}: $${state.market.price} (${state.market.changePct}%). Bridge=${state.bridge.connected ? 'ON' : 'OFF'}, Frank=${state.frank.connected ? 'CONNECTED' : 'WAITING'}, Bot=${state.bot.running ? 'RUNNING' : 'PAUSED'}, Position=${state.position.side} ${state.position.size}.`;
-  state.chat.push({ role: 'assistant', message: reply, t: Date.now() });
-  res.json({ ok: true, reply, state });
+  res.json({ ok: true, queued: true });
 });
 
 const server = http.createServer(app);
