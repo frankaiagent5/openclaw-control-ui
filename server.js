@@ -31,6 +31,8 @@ const state = {
 
 let commandSeq = 1;
 const pendingCommands = [];
+let pendingVerification = null;
+let lastCommandAt = 0;
 
 function pushActivity(msg) {
   state.activity.unshift({ t: Date.now(), msg });
@@ -88,18 +90,20 @@ app.get('/api/bridge/inject.js', (req, res) => {
  const roll=(price)=>{const slot=Math.floor(Date.now()/5000)*5000; if(!bar||bar.t!==slot){ if(bar) candles.push(bar); bar={t:slot,o:price,h:price,l:price,c:price}; if(candles.length>240)candles.shift(); } else { bar.h=Math.max(bar.h,price); bar.l=Math.min(bar.l,price); bar.c=price; }};
  const pullCommands=async()=>{try{const r=await fetch(host+'/api/bridge/commands');const j=await r.json();return j.commands||[]}catch{return []}};
  const clickByText=(re)=>{const els=[...document.querySelectorAll('button,[role=button],a,div,span')];const el=els.find(e=>re.test((e.textContent||'').trim())&&e.offsetParent!==null);if(el){el.click();return true;}return false;};
+ const getSide=()=>{const t=(document.body?.innerText||'').toLowerCase(); if(/\bflat\b/.test(t)) return 'FLAT'; if(/\blong\b/.test(t)) return 'LONG'; if(/\bshort\b/.test(t)) return 'SHORT'; return 'UNKNOWN';};
  const execCmd=async(c)=>{let ok=false, note='no matching control found';
-   if(c.type==='BUY'){ok=clickByText(/\\bbuy\\b/i); note=ok?'BUY clicked':note;}
-   if(c.type==='SELL'){ok=clickByText(/\\b(sell|short)\\b/i); note=ok?'SELL/SHORT clicked':note;}
-   if(c.type==='FLATTEN'){ok=clickByText(/flatten|close all|close position/i); note=ok?'FLATTEN clicked':note;}
-   try{await fetch(host+'/api/bridge/ack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:c.id,ok,note})})}catch{}
+   if(c.type==='BUY'){ok=clickByText(/\\bbuy\\b/i); note=ok?'BUY click sent':note;}
+   if(c.type==='SELL'){ok=clickByText(/\\b(sell|short)\\b/i); note=ok?'SELL/SHORT click sent':note;}
+   if(c.type==='FLATTEN'){ok=clickByText(/flatten|close all|close position/i); note=ok?'FLATTEN click sent':note;}
+   try{await fetch(host+'/api/bridge/ack',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:c.id,ok,note,phase:'click'})})}catch{}
  };
  const push=async()=>{
    const symbol=getSymbol();
    const price=getPrice();
+   const positionSide=getSide();
    if(price){roll(price);}
    const fullBars=bar?[...candles.slice(-119),bar]:candles.slice(-120);
-   const payload={symbol,timeframe:'1m',price,candles:fullBars,raw:{title:document.title,href:location.href}};
+   const payload={symbol,timeframe:'1m',price,positionSide,candles:fullBars,raw:{title:document.title,href:location.href}};
    try{await fetch(host+'/api/bridge/push',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});}catch(e){}
    const cmds=await pullCommands();
    for(const c of cmds) await execCmd(c);
@@ -111,7 +115,7 @@ app.get('/api/bridge/inject.js', (req, res) => {
 });
 
 app.post('/api/bridge/push', (req, res) => {
-  const { symbol, timeframe, price, candles, raw } = req.body || {};
+  const { symbol, timeframe, price, positionSide, candles, raw } = req.body || {};
   state.bridge.connected = true;
   state.bridge.source = 'replay.tradingterminal.com';
   state.bridge.lastSeen = Date.now();
@@ -119,6 +123,7 @@ app.post('/api/bridge/push', (req, res) => {
   if (symbol && symbol !== 'UNKNOWN') state.market.symbol = String(symbol).toUpperCase();
   if (timeframe) state.market.timeframe = timeframe;
   if (typeof price === 'number' && Number.isFinite(price)) state.market.price = +price.toFixed(2);
+  if (positionSide && ['LONG','SHORT','FLAT'].includes(positionSide)) state.position.side = positionSide;
   if (Array.isArray(candles)) {
     const cleaned = [];
     for (const b of candles.slice(-240)) {
@@ -138,27 +143,37 @@ app.post('/api/bridge/push', (req, res) => {
     const base = state.market.candles[0].c ?? state.market.candles[0].close ?? state.market.price;
     state.market.changePct = +(((state.market.price - base) / base) * 100).toFixed(2);
   }
+  if (pendingVerification) {
+    const age = Date.now() - pendingVerification.t;
+    const sideOk = pendingVerification.expectSide === 'ANY' || state.position.side === pendingVerification.expectSide;
+    if (sideOk) {
+      pushActivity(`Exec ${pendingVerification.id}: FILLED (state=${state.position.side})`);
+      pendingVerification = null;
+    } else if (age > 7000) {
+      pushActivity(`Exec ${pendingVerification.id}: NO_CHANGE (state=${state.position.side})`);
+      pendingVerification = null;
+    }
+  }
   if (raw?.title && Math.random() < 0.02) pushActivity(`Bridge sync: ${raw.title}`);
   res.json({ ok: true });
 });
 
 app.get('/api/bridge/commands', (req, res) => {
-  const cmds = pendingCommands.splice(0, pendingCommands.length);
-  res.json({ ok: true, commands: cmds });
+  if (pendingVerification) return res.json({ ok: true, commands: [] });
+  const now = Date.now();
+  if (now - lastCommandAt < 5000) return res.json({ ok: true, commands: [] });
+  const cmd = pendingCommands.shift();
+  if (!cmd) return res.json({ ok: true, commands: [] });
+  lastCommandAt = now;
+  const expectSide = cmd.type === 'BUY' ? 'LONG' : cmd.type === 'SELL' ? 'SHORT' : cmd.type === 'FLATTEN' ? 'FLAT' : 'ANY';
+  pendingVerification = { id: cmd.id, expectSide, t: now };
+  res.json({ ok: true, commands: [cmd] });
 });
 
 app.post('/api/bridge/ack', (req, res) => {
-  const { id, ok, note } = req.body || {};
-  pushActivity(`Exec ${id}: ${ok ? 'OK' : 'FAILED'}${note ? ` (${note})` : ''}`);
-  if (ok && String(id).includes('BUY')) {
-    state.position = { side: 'LONG', size: 100, entry: state.market.price, stop: +(state.market.price - 1.5).toFixed(2), unrealized: 0 };
-  }
-  if (ok && String(id).includes('SELL')) {
-    state.position = { side: 'SHORT', size: 100, entry: state.market.price, stop: +(state.market.price + 1.5).toFixed(2), unrealized: 0 };
-  }
-  if (ok && String(id).includes('FLATTEN')) {
-    state.position = { side: 'FLAT', size: 0, entry: null, stop: null, unrealized: 0 };
-  }
+  const { id, ok, note, phase } = req.body || {};
+  if (!ok) pushActivity(`Exec ${id}: CLICK_FAILED${note ? ` (${note})` : ''}`);
+  else if (phase === 'click') pushActivity(`Exec ${id}: CLICK_SENT`);
   res.json({ ok: true });
 });
 
