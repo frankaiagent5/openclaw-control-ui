@@ -73,6 +73,114 @@ setInterval(() => {
 
 app.get('/api/state', (req, res) => res.json(state));
 
+const POLYGON_BASE = 'https://api.polygon.io';
+function polygonKey() { return process.env.POLYGON_API_KEY || ''; }
+async function polygonGet(path, params = {}) {
+  const key = polygonKey();
+  if (!key) throw new Error('POLYGON_API_KEY missing');
+  const q = new URLSearchParams({ ...params, apiKey: key });
+  const r = await fetch(`${POLYGON_BASE}${path}?${q.toString()}`);
+  if (!r.ok) throw new Error(`Polygon ${r.status}`);
+  return r.json();
+}
+function etHM(ts) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', hour12: false, hour: '2-digit', minute: '2-digit'
+  }).formatToParts(new Date(ts));
+  const hour = Number(parts.find(p => p.type === 'hour')?.value || 0);
+  const minute = Number(parts.find(p => p.type === 'minute')?.value || 0);
+  return hour * 60 + minute;
+}
+
+app.get('/api/polygon/test', async (req, res) => {
+  try {
+    const snap = await polygonGet('/v2/snapshot/locale/us/markets/stocks/tickers/AAPL');
+    res.json({ ok: true, hasKey: !!polygonKey(), ticker: snap?.ticker?.ticker || 'AAPL' });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e.message || e) });
+  }
+});
+
+app.get('/api/market/levels', async (req, res) => {
+  const ticker = String(req.query.ticker || '').toUpperCase();
+  if (!ticker) return res.status(400).json({ ok: false, error: 'ticker required' });
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const prev = await polygonGet(`/v2/aggs/ticker/${ticker}/prev`, { adjusted: 'true' });
+    const snap = await polygonGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+
+    let priorClose = prev?.results?.[0]?.c ?? snap?.ticker?.prevDay?.c ?? null;
+    let avgVol = snap?.ticker?.prevDay?.v ?? null;
+
+    let atr = null;
+    try {
+      const atrJson = await polygonGet(`/v1/indicators/atr/${ticker}`, {
+        timespan: 'day', adjusted: 'true', window: '14', series_type: 'close', order: 'desc', limit: '1'
+      });
+      atr = atrJson?.results?.values?.[0]?.value ?? null;
+    } catch (_) {
+      // fallback ATR approximation from daily ranges
+      const from = new Date(Date.now() - 1000 * 60 * 60 * 24 * 40).toISOString().slice(0, 10);
+      const daily = await polygonGet(`/v2/aggs/ticker/${ticker}/range/1/day/${from}/${today}`, { adjusted: 'true', sort: 'desc', limit: '20' });
+      const ranges = (daily?.results || []).slice(0, 14).map(b => (b.h - b.l)).filter(Number.isFinite);
+      atr = ranges.length ? ranges.reduce((a, b) => a + b, 0) / ranges.length : null;
+    }
+
+    const mins = await polygonGet(`/v2/aggs/ticker/${ticker}/range/1/minute/${today}/${today}`, {
+      adjusted: 'true', sort: 'asc', limit: '50000'
+    });
+    const pmBars = (mins?.results || []).filter(b => {
+      const m = etHM(b.t);
+      return m >= (4 * 60) && m < (9 * 60 + 30);
+    });
+
+    const pmHigh = pmBars.length ? Math.max(...pmBars.map(b => b.h)) : null;
+    const pmLow = pmBars.length ? Math.min(...pmBars.map(b => b.l)) : null;
+    const sumPV = pmBars.reduce((a, b) => a + ((b.vw ?? b.c) * (b.v || 0)), 0);
+    const sumV = pmBars.reduce((a, b) => a + (b.v || 0), 0);
+    const pmVWAP = sumV > 0 ? (sumPV / sumV) : null;
+
+    const atrUpper = (priorClose != null && atr != null) ? priorClose + atr : null;
+    const atrLower = (priorClose != null && atr != null) ? priorClose - atr : null;
+    const withinAtr = (pmHigh != null && pmLow != null && atrUpper != null && atrLower != null)
+      ? (pmHigh <= atrUpper && pmLow >= atrLower)
+      : null;
+
+    res.json({
+      ok: true,
+      ticker,
+      priorClose,
+      avgDailyVol: avgVol,
+      atr,
+      pmHigh,
+      pmLow,
+      pmVWAP,
+      atrUpper,
+      atrLower,
+      withinAtr,
+      passesBaseFilters: (priorClose >= 20) && (avgVol >= 15000000)
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, ticker, error: String(e.message || e) });
+  }
+});
+
+app.get('/api/market/scan', async (req, res) => {
+  const raw = String(req.query.tickers || 'NVDA,AMD,MU,INTC,AAPL,TSLA,MSFT,AMZN,META,GOOGL').toUpperCase();
+  const tickers = raw.split(',').map(s => s.trim()).filter(Boolean).slice(0, 30);
+  const out = [];
+  for (const t of tickers) {
+    try {
+      const r = await fetch(`http://127.0.0.1:${process.env.PORT || 4273}/api/market/levels?ticker=${encodeURIComponent(t)}`);
+      const j = await r.json();
+      if (!j.ok) continue;
+      const pass = j.passesBaseFilters && j.withinAtr === true;
+      out.push({ ticker: t, pass, ...j });
+    } catch (_) {}
+  }
+  res.json({ ok: true, total: out.length, passed: out.filter(x => x.pass).length, results: out });
+});
+
 app.get('/api/bridge/inject.js', (req, res) => {
   const host = `${req.protocol}://${req.get('host')}`;
   const script = `(function(){
