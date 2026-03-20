@@ -104,28 +104,52 @@ app.get('/api/polygon/test', async (req, res) => {
 app.get('/api/market/levels', async (req, res) => {
   const ticker = String(req.query.ticker || '').toUpperCase();
   if (!ticker) return res.status(400).json({ ok: false, error: 'ticker required' });
+
+  const warnings = [];
+  const today = new Date().toISOString().slice(0, 10);
+  let priorClose = null;
+  let avgVol = null;
+  let atr = null;
+  let pmHigh = null;
+  let pmLow = null;
+  let pmVWAP = null;
+
   try {
-    const today = new Date().toISOString().slice(0, 10);
-    const prev = await polygonGet(`/v2/aggs/ticker/${ticker}/prev`, { adjusted: 'true' });
     const snap = await polygonGet(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+    priorClose = snap?.ticker?.prevDay?.c ?? priorClose;
+    avgVol = snap?.ticker?.prevDay?.v ?? avgVol;
+  } catch (e) {
+    warnings.push(`snapshot_unavailable:${String(e.message || e)}`);
+  }
 
-    let priorClose = prev?.results?.[0]?.c ?? snap?.ticker?.prevDay?.c ?? null;
-    let avgVol = snap?.ticker?.prevDay?.v ?? null;
+  try {
+    const prev = await polygonGet(`/v2/aggs/ticker/${ticker}/prev`, { adjusted: 'true' });
+    priorClose = prev?.results?.[0]?.c ?? priorClose;
+  } catch (e) {
+    warnings.push(`prev_unavailable:${String(e.message || e)}`);
+  }
 
-    let atr = null;
+  try {
+    const atrJson = await polygonGet(`/v1/indicators/atr/${ticker}`, {
+      timespan: 'day', adjusted: 'true', window: '14', series_type: 'close', order: 'desc', limit: '1'
+    });
+    atr = atrJson?.results?.values?.[0]?.value ?? null;
+  } catch (e) {
+    warnings.push(`atr_indicator_unavailable:${String(e.message || e)}`);
+  }
+
+  if (atr == null) {
     try {
-      const atrJson = await polygonGet(`/v1/indicators/atr/${ticker}`, {
-        timespan: 'day', adjusted: 'true', window: '14', series_type: 'close', order: 'desc', limit: '1'
-      });
-      atr = atrJson?.results?.values?.[0]?.value ?? null;
-    } catch (_) {
-      // fallback ATR approximation from daily ranges
       const from = new Date(Date.now() - 1000 * 60 * 60 * 24 * 40).toISOString().slice(0, 10);
       const daily = await polygonGet(`/v2/aggs/ticker/${ticker}/range/1/day/${from}/${today}`, { adjusted: 'true', sort: 'desc', limit: '20' });
       const ranges = (daily?.results || []).slice(0, 14).map(b => (b.h - b.l)).filter(Number.isFinite);
       atr = ranges.length ? ranges.reduce((a, b) => a + b, 0) / ranges.length : null;
+    } catch (e) {
+      warnings.push(`atr_fallback_unavailable:${String(e.message || e)}`);
     }
+  }
 
+  try {
     const mins = await polygonGet(`/v2/aggs/ticker/${ticker}/range/1/minute/${today}/${today}`, {
       adjusted: 'true', sort: 'asc', limit: '50000'
     });
@@ -133,36 +157,39 @@ app.get('/api/market/levels', async (req, res) => {
       const m = etHM(b.t);
       return m >= (4 * 60) && m < (9 * 60 + 30);
     });
-
-    const pmHigh = pmBars.length ? Math.max(...pmBars.map(b => b.h)) : null;
-    const pmLow = pmBars.length ? Math.min(...pmBars.map(b => b.l)) : null;
+    pmHigh = pmBars.length ? Math.max(...pmBars.map(b => b.h)) : null;
+    pmLow = pmBars.length ? Math.min(...pmBars.map(b => b.l)) : null;
     const sumPV = pmBars.reduce((a, b) => a + ((b.vw ?? b.c) * (b.v || 0)), 0);
     const sumV = pmBars.reduce((a, b) => a + (b.v || 0), 0);
-    const pmVWAP = sumV > 0 ? (sumPV / sumV) : null;
-
-    const atrUpper = (priorClose != null && atr != null) ? priorClose + atr : null;
-    const atrLower = (priorClose != null && atr != null) ? priorClose - atr : null;
-    const withinAtr = (pmHigh != null && pmLow != null && atrUpper != null && atrLower != null)
-      ? (pmHigh <= atrUpper && pmLow >= atrLower)
-      : null;
-
-    res.json({
-      ok: true,
-      ticker,
-      priorClose,
-      avgDailyVol: avgVol,
-      atr,
-      pmHigh,
-      pmLow,
-      pmVWAP,
-      atrUpper,
-      atrLower,
-      withinAtr,
-      passesBaseFilters: (priorClose >= 20) && (avgVol >= 15000000)
-    });
+    pmVWAP = sumV > 0 ? (sumPV / sumV) : null;
   } catch (e) {
-    res.status(500).json({ ok: false, ticker, error: String(e.message || e) });
+    warnings.push(`premarket_minute_unavailable:${String(e.message || e)}`);
   }
+
+  const atrUpper = (priorClose != null && atr != null) ? priorClose + atr : null;
+  const atrLower = (priorClose != null && atr != null) ? priorClose - atr : null;
+  const withinAtr = (pmHigh != null && pmLow != null && atrUpper != null && atrLower != null)
+    ? (pmHigh <= atrUpper && pmLow >= atrLower)
+    : null;
+
+  const passesBaseFilters = Number(priorClose) >= 20 && Number(avgVol) >= 15000000;
+
+  res.json({
+    ok: true,
+    ticker,
+    priorClose,
+    avgDailyVol: avgVol,
+    atr,
+    pmHigh,
+    pmLow,
+    pmVWAP,
+    atrUpper,
+    atrLower,
+    withinAtr,
+    passesBaseFilters,
+    degraded: warnings.length > 0,
+    warnings
+  });
 });
 
 app.get('/api/market/scan', async (req, res) => {
@@ -174,8 +201,9 @@ app.get('/api/market/scan', async (req, res) => {
       const r = await fetch(`http://127.0.0.1:${process.env.PORT || 4273}/api/market/levels?ticker=${encodeURIComponent(t)}`);
       const j = await r.json();
       if (!j.ok) continue;
-      const pass = j.passesBaseFilters && j.withinAtr === true;
-      out.push({ ticker: t, pass, ...j });
+      const atrEligible = (j.withinAtr === true) || (j.withinAtr == null);
+      const pass = j.passesBaseFilters && atrEligible;
+      out.push({ ticker: t, pass, atrEligible, ...j });
     } catch (_) {}
   }
   res.json({ ok: true, total: out.length, passed: out.filter(x => x.pass).length, results: out });
